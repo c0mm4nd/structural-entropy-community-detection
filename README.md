@@ -13,7 +13,7 @@ pip install structural-entropy-community-detection
 Or you can directly install the latest version from the GitHub repository:
 
 ```bash
-pip install git+hhttps://github.com/c0mm4nd/structural-entropy-community-detection
+pip install git+https://github.com/c0mm4nd/structural-entropy-community-detection
 ```
 
 ## Usage

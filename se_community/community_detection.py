@@ -1,133 +1,10 @@
+from typing import Dict
 import networkx as nx
-from scipy.special import xlogy
-from collections import defaultdict
 import numpy as np
 import multiprocessing as mp
 
-
-def _compute_community_entropy(G, partition, community, volume):
-    """
-    Compute the entropy contribution of a single community.
-    """
-    nodes = [node for node, comm in partition.items() if comm == community]
-    subgraph = G.subgraph(nodes)
-
-    # Internal volume: sum of the degrees of nodes within the community
-    internal_volume = sum(dict(subgraph.degree()).values())
-
-    # External volume: total volume minus internal volume
-    external_volume = volume - internal_volume
-
-    # Calculate probabilities
-    p = internal_volume / volume if volume > 0 else 0
-    q = external_volume / volume if volume > 0 else 0
-
-    entropy = 0
-    # Compute entropy contribution if probabilities are non-zero
-    if p > 0:
-        entropy -= xlogy(p, p)
-    if q > 0:
-        entropy -= xlogy(q, q)
-
-    # Cross-community edges: count edges between nodes in this community and others
-    external_edges = 0
-    for node in nodes:
-        external_edges += sum(
-            1 for neighbor in G.neighbors(node) if partition[neighbor] != community
-        )
-
-    # Adjust entropy based on external edges
-    if external_edges > 0:
-        external_probability = external_edges / (2 * G.number_of_edges())
-        entropy -= xlogy(external_probability, external_probability)
-
-    return entropy
-
-
-def compute_structural_entropy_mp(G, partition):
-    """
-    Compute the structural entropy of a graph partition.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        The input graph
-    partition : dict
-        A dictionary mapping node labels to community labels
-
-    Returns
-    -------
-    float
-        The structural entropy of the partition
-    """
-    volume = sum(dict(G.degree()).values())
-    communities = set(partition.values())
-
-    # Use multiprocessing to compute entropy for each community in parallel
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        results = pool.starmap(
-            _compute_community_entropy,
-            [(G, partition, community, volume) for community in communities],
-        )
-
-    # Sum up the entropy contributions from all communities
-    total_entropy = sum(results)
-
-    return total_entropy
-
-
-def compute_structural_entropy(G, partition):
-    """
-    Compute the structural entropy of a graph partition.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        The input graph
-    partition : dict
-        A dictionary mapping node labels to community labels
-
-    Returns
-    -------
-    float
-        The structural entropy of the partition
-    """
-    volume = sum(dict(G.degree()).values())
-    entropy = 0
-    # Loop over each community
-    for community in set(partition.values()):
-        nodes = [node for node, comm in partition.items() if comm == community]
-        subgraph = G.subgraph(nodes)
-
-        # Internal volume: sum of the degrees of nodes within the community
-        internal_volume = sum(dict(subgraph.degree()).values())
-
-        # External volume: total volume minus internal volume
-        external_volume = volume - internal_volume
-
-        # Calculate probabilities
-        p = internal_volume / volume if volume > 0 else 0
-        q = external_volume / volume if volume > 0 else 0
-
-        # Compute entropy contribution if probabilities are non-zero
-        if p > 0:
-            entropy -= xlogy(p, p)
-        if q > 0:
-            entropy -= xlogy(q, q)
-
-        # Cross-community edges: count edges between nodes in this community and others
-        external_edges = 0
-        for node in nodes:
-            external_edges += sum(
-                1 for neighbor in G.neighbors(node) if partition[neighbor] != community
-            )
-
-        # Adjust entropy based on external edges
-        if external_edges > 0:
-            external_probability = external_edges / (2 * G.number_of_edges())
-            entropy -= xlogy(external_probability, external_probability)
-
-    return entropy
+from se_community.optimization import merge_small_communities, optimize_boundary_nodes
+from se_community.structural_entropy import compute_structural_entropy
 
 
 def _swap_entropy(G, partition, node_i, node_j, initial_entropy):
@@ -144,40 +21,24 @@ def _swap_entropy(G, partition, node_i, node_j, initial_entropy):
     return (entropy_gain, node_i, node_j)
 
 
-def _kernighan_lin(G, initial_partition, max_iterations: int = 100):
-    """
-    Refine the partition using the Kernighan-Lin algorithm.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        The input graph
-    initial_partition : dict
-        The initial partition mapping nodes to community labels.
-    max_iterations : int, optional
-        Maximum number of iterations (default is 100).
-
-    Returns
-    -------
-    dict
-        The refined partition.
-    """
+def _kernighan_lin(
+    G, initial_partition, *, max_iterations: int = 100, verbose=False
+) -> Dict[int, str]:
     nodes = list(G.nodes())
     partition = initial_partition.copy()
-    initial_entropy = compute_structural_entropy(G, initial_partition)
+    best_partition = partition.copy()
+    original_entropy = compute_structural_entropy(G, initial_partition)
+    best_entropy = original_entropy
 
-    for _ in range(max_iterations):
-        improved = False
+    for iteration in range(max_iterations):
         gains = []
-        best_partition = partition.copy()
-        best_entropy = initial_entropy
 
         # Create a multiprocessing pool to parallelize swaps
         with mp.Pool(processes=mp.cpu_count()) as pool:
             swap_results = pool.starmap(
                 _swap_entropy,
                 [
-                    (G, partition, nodes[i], nodes[j], initial_entropy)
+                    (G, partition, nodes[i], nodes[j], best_entropy)
                     for i in range(len(nodes))
                     for j in range(i + 1, len(nodes))
                     if partition[nodes[i]] != partition[nodes[j]]
@@ -191,6 +52,8 @@ def _kernighan_lin(G, initial_partition, max_iterations: int = 100):
 
         # If no improvements, break early
         if not gains:
+            if verbose:
+                print("No improvements found, stopping early")
             break
 
         # Find the best swap
@@ -200,170 +63,137 @@ def _kernighan_lin(G, initial_partition, max_iterations: int = 100):
         partition[best_i], partition[best_j] = partition[best_j], partition[best_i]
         best_entropy -= best_gain
         best_partition = partition.copy()  # Update the best partition
-        improved = True
 
-        if not improved:
-            break
+        if verbose:
+            print(f"Iteration {iteration}: {best_entropy} ")
 
     return best_partition
 
 
-def _two_way_partition(G, max_iterations=100):
+# split the nodes in the graph into two communities, a and b
+def _two_way_partition(
+    G: nx.Graph, hierarchical_label_prefix: str, *, max_iterations=100, verbose=False
+):
+    if verbose:
+        print(f"Two-Way Partition: {G.number_of_nodes()}, {G.number_of_edges()}")
+
     # Initial partition: spectral bisection
     laplacian = nx.laplacian_matrix(G)
     eigenvalues, eigenvectors = np.linalg.eigh(laplacian.toarray())
     fiedler_vector = eigenvectors[:, 1]
     initial_partition = {
-        node: 0 if fiedler_vector[i] >= 0 else 1 for i, node in enumerate(G.nodes())
+        node: (
+            hierarchical_label_prefix + "0"
+            if fiedler_vector[i] >= 0
+            else hierarchical_label_prefix + "1"
+        )
+        for i, node in enumerate(G.nodes())
     }
 
     # Refine the partition using Kernighan-Lin algorithm
-    refined_partition = _kernighan_lin(G, initial_partition, max_iterations)
+    refined_partition = _kernighan_lin(
+        G, initial_partition, max_iterations=max_iterations, verbose=verbose
+    )
 
     return refined_partition
 
 
 def _recursive_partition(
-    G,
+    G: nx.Graph,
+    hierarchical_label_prefix: str,
+    original_structural_entropy: float,
+    *,
     level=0,
-    entropy_threshold=0.01,
     max_depth=10,
     max_iterations=100,
+    entropy_threshold=0.01,
     min_community_size=2,
+    verbose=False,
 ):
+    if verbose:
+        print(f"Recursive Level {level}: {G.number_of_nodes()} nodes")
     if G.number_of_nodes() <= min_community_size or level >= max_depth:
-        return {node: f"{level}.0" for node in G.nodes()}
-
-    partition = _two_way_partition(G, max_iterations)
-
-    original_entropy = compute_structural_entropy(G, {node: 0 for node in G.nodes()})
-    new_entropy = compute_structural_entropy(G, partition)
-
-    if new_entropy >= original_entropy - entropy_threshold:
-        return partition
-
-    subgraphs = [
-        G.subgraph([node for node, part in partition.items() if part == i])
-        for i in set(partition.values())
-    ]
-
-    for i, subgraph in enumerate(subgraphs):
-        # Only continue partitioning if the subgraph size is above the minimum threshold
-        if subgraph.number_of_nodes() > min_community_size:
-            sub_partition = _recursive_partition(
-                subgraph, level + 1, entropy_threshold, max_depth, max_iterations
+        if verbose:
+            print(
+                f"Reached max depth {level} or min community size {G.number_of_nodes()}"
             )
-            for node, sub_comm in sub_partition.items():
-                partition[node] = f"{i}.{sub_comm}"
-        else:
-            # Assign a unique label if subgraph is too small to partition further
-            for node in subgraph.nodes():
-                partition[node] = f"{i}.0"
 
-    return partition
+        return {node: hierarchical_label_prefix + "0" for node in G.nodes()}
 
-
-def _merge_node(G, partition, small_communities, node):
-    comm = partition[node]
-    if comm in small_communities:
-        neighbors = list(G.neighbors(node))
-        neighbor_comms = [
-            partition[neigh]
-            for neigh in neighbors
-            if partition[neigh] not in small_communities
-        ]
-        if neighbor_comms:
-            return node, max(set(neighbor_comms), key=neighbor_comms.count)
-    return node, comm
-
-
-def _merge_small_communities(G, partition, size_threshold=5):
-    community_sizes = defaultdict(int)
-    for comm in partition.values():
-        community_sizes[comm] += 1
-
-    small_communities = [
-        comm for comm, size in community_sizes.items() if size < size_threshold
-    ]
-
-    # Use multiprocessing to merge small communities in parallel
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        results = pool.starmap(
-            _merge_node, [(G, partition, small_communities, node) for node in G.nodes()]
-        )
-
-    # Update the partition based on the results
-    for node, new_comm in results:
-        partition[node] = new_comm
-
-    return partition
-
-
-def _optimize_node(G, partition, node):
-    current_community = partition[node]
-    neighbor_comms = defaultdict(float)
-    for neighbor in G.neighbors(node):
-        neighbor_comm = partition[neighbor]
-        edge_weight = G[node][neighbor].get(
-            "weight", 1
-        )  # Use edge weight if present, otherwise assume 1
-        neighbor_comms[neighbor_comm] += edge_weight
-
-    best_community = max(
-        neighbor_comms, key=neighbor_comms.get, default=current_community
+    binary_partition = _two_way_partition(
+        G,
+        hierarchical_label_prefix=hierarchical_label_prefix,
+        max_iterations=max_iterations,
+        verbose=verbose,
     )
 
-    if best_community != current_community:
-        original_partition = partition.copy()
-        partition[node] = best_community
-        old_entropy = compute_structural_entropy(G, original_partition)
-        new_entropy = compute_structural_entropy(G, partition)
+    new_structural_entropy = compute_structural_entropy(G, binary_partition)
+    if verbose:
+        print(f"Original Entropy: {original_structural_entropy}")
+        print(f"New Entropy: {new_structural_entropy}")
 
-        if new_entropy > old_entropy:
-            return node, current_community
-        return node, best_community
+    partition = binary_partition.copy()
 
-    return node, current_community
+    # If the new partition entropy get better but decrease level is not enough, stop partitioning
+    if (
+        new_structural_entropy < original_structural_entropy
+        and new_structural_entropy > original_structural_entropy - entropy_threshold
+    ):
+        if verbose:
+            print("New partition is already better, keep this partition")
+        return partition
+    else:
+        if verbose:
+            print("New partition is not better, continue partitioning its subgraphs")
 
+        # Split the graph into subgraphs based on the partition
+        subgraphs = [
+            G.subgraph([node for node, part in partition.items() if part == i])
+            for i in set(partition.values())
+        ]
 
-def _optimize_boundary_nodes(G, partition):
-    """
-    Optimize the boundary nodes by reassigning them to their most appropriate community,
-    considering both the number and strength of connections to neighboring communities.
+        for i, subgraph in enumerate(subgraphs):
+            # Only continue partitioning if the subgraph size is above the minimum threshold
+            if subgraph.number_of_nodes() > min_community_size:
+                if verbose:
+                    print(
+                        f"Partitioning Subgraph {i} with {subgraph.number_of_nodes()} nodes"
+                    )
+                subgraph_entropy = compute_structural_entropy(subgraph, {n: 0 for n in subgraph.nodes()})
 
-    Parameters
-    ----------
-    G : networkx.Graph
-        The input graph.
-    partition : dict
-        The current partition mapping nodes to community labels.
+                sub_partition = _recursive_partition(
+                    subgraph,
+                    hierarchical_label_prefix=hierarchical_label_prefix + str(i),
+                    original_structural_entropy=subgraph_entropy,
+                    level=level + 1,
+                    max_depth=max_depth,
+                    max_iterations=max_iterations,
+                    verbose=verbose,
+                )
+                partition.update(sub_partition)
 
-    Returns
-    -------
-    dict
-        The optimized partition.
-    """
-    # Use multiprocessing to optimize boundary nodes in parallel
-    # Use multiprocessing to optimize boundary nodes in parallel
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        results = pool.starmap(
-            _optimize_node, [(G, partition, node) for node in G.nodes()]
-        )
+            else:
+                # Assign a unique label if subgraph is too small to partition further
+                if verbose:
+                    print(f"Subgraph {i} too small to partition further")
+                partition.update(
+                    {
+                        node: hierarchical_label_prefix + str(i)
+                        for node in subgraph.nodes()
+                    }
+                )
 
-    # Update the partition based on the results
-    for node, new_comm in results:
-        partition[node] = new_comm
-
-    return partition
+        return partition
 
 
 def community_detection(
-    G,
-    size_threshold=5,
-    entropy_threshold=0.001,
+    G: nx.Graph,
+    *,
     max_depth=15,
     max_iterations=100,
-    minimum_community_size=2,
+    size_threshold=5,
+    min_community_size=2,
+    verbose=False,
 ):
     """
     Detect communities in a graph based on structural entropy minimizing.
@@ -388,15 +218,37 @@ def community_detection(
     dict
         A dictionary mapping node labels to community labels
     """
+    original_structural_entropy = compute_structural_entropy(
+        G, {node: 0 for node in G.nodes()}
+    )
+    if verbose:
+        print(f"Community Detection: {G.number_of_nodes()}, {G.number_of_edges()}")
+        print(f"Original Entropy: {original_structural_entropy}")
+
     partition = _recursive_partition(
-        G, 0, entropy_threshold, max_depth, max_iterations, minimum_community_size
+        G,
+        hierarchical_label_prefix="",
+        original_structural_entropy=original_structural_entropy,
+        level=0,
+        max_depth=max_depth,
+        max_iterations=max_iterations,
+        min_community_size=min_community_size,
+        verbose=verbose,
     )
 
+    if verbose:
+        print(f"Partition entropy: {compute_structural_entropy(G, partition)}")
+
     # Merge small communities
-    partition = _merge_small_communities(G, partition, size_threshold)
+    partition = merge_small_communities(G, partition, size_threshold)
+    if verbose:
+        print(f"Merge Small entropy: {compute_structural_entropy(G, partition)}")
 
     # Optimize boundary nodes
-    partition = _optimize_boundary_nodes(G, partition)
+    partition = optimize_boundary_nodes(G, partition)
+
+    if verbose:
+        print(f"Optimize Boundary entropy: {compute_structural_entropy(G, partition)}")
 
     # Convert hierarchical labels to flat numeric labels
     unique_labels = sorted(set(partition.values()))

@@ -1,6 +1,6 @@
 # Structural Entropy Community Detection
 
-This repository contains the code for structural entropy community detection. The philosophy behind this method is to use the structural entropy of a network to detect communities. The structural entropy is a measure of the uncertainty of the network structure. The idea is that the higher the uncertainty, the more likely it is that the network is divided into communities.
+This repository contains the code for structural entropy community detection. The philosophy behind this method is to use the structural entropy of a network to detect communities. The structural entropy is a measure of the uncertainty of the network structure. The idea is that the higher the uncertainty, the more likely it is that the network is divided into communities. 
 
 ## Installation
 
